@@ -1,3 +1,5 @@
+import NIOConcurrencyHelpers
+
 /// Caches `DatabaseConnectionPool`s on a `Container`.
 internal final class DatabaseConnectionPoolCache: ServiceType {
     /// See `ServiceType`.
@@ -17,17 +19,26 @@ internal final class DatabaseConnectionPoolCache: ServiceType {
     /// The pool configuration settings.
     private let config: DatabaseConnectionPoolConfig
 
+    /// Synchronize access.
+    private let lock: Lock
+
     /// Creates a new `DatabaseConnectionPoolCache`.
     internal init(databases: Databases, config: DatabaseConnectionPoolConfig, on worker: Worker) {
         self.databases = databases
         self.eventLoop = worker.eventLoop
         self.config = config
         self.cache = [:]
+        self.lock = .init()
     }
 
     /// Fetches the `DatabaseConnectionPool` for the identified `Database`.
     internal func requirePool<D>(for dbid: DatabaseIdentifier<D>) throws -> DatabaseConnectionPool<ConfiguredDatabase<D>>
     {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+
         if let existing = cache[dbid.uid] as? DatabaseConnectionPool<ConfiguredDatabase<D>> {
             return existing
         } else {

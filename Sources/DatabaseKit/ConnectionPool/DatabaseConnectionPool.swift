@@ -1,3 +1,5 @@
+import NIOConcurrencyHelpers
+
 /// Holds a collection of active `DatabaseConnection`s that can be requested and later released
 /// back into the pool. New connections are created as needed when a connection is requested and none
 /// are available until the max limit is reached. After the maximum is reached, no new connections will
@@ -25,6 +27,9 @@ public final class DatabaseConnectionPool<Database> where Database: DatabaseKit.
     /// Available connections.
     private var actives: [ActiveDatabasePoolConnection<Database>]
     private var activeCount: Int = 0
+    
+    /// Synchronize access.
+    private let lock: Lock
 
     /// Notified when more connections are available.
     private var waiters: [Promise<Database.Connection>]
@@ -38,6 +43,7 @@ public final class DatabaseConnectionPool<Database> where Database: DatabaseKit.
         self.config = config
         self.actives = []
         self.waiters = []
+        self.lock = .init()
     }
 
     // MARK: Methods
@@ -80,9 +86,11 @@ public final class DatabaseConnectionPool<Database> where Database: DatabaseKit.
     ///
     /// - returns: A future containing the pooled `DatabaseConnection`.
     public func requestConnection() -> Future<Database.Connection> {
+        lock.lock()
         if let active = actives.first(where: { $0.isAvailable }) {
             // there is an available connection, take it
             active.isAvailable = false
+            lock.unlock()
 
             // check if it is still open
             if !active.connection.isClosed {
@@ -106,15 +114,20 @@ public final class DatabaseConnectionPool<Database> where Database: DatabaseKit.
         } else if activeCount < config.maxConnections  {
             // all connections are busy, but we have room to open a new connection!
             self.activeCount += 1
+            lock.unlock()
 
             // make the new connection
             return database.newConnection(on: eventLoop).map { newConn in
                 let active = ActiveDatabasePoolConnection<Database>(connection: newConn)
+                self.lock.lock()
                 self.actives.append(active)
+                self.lock.unlock()
 
                 return newConn
             }.catchMap { error in
+                self.lock.lock()
                 self.activeCount -= 1
+                self.lock.unlock()
 
                 throw error
             }
@@ -122,6 +135,7 @@ public final class DatabaseConnectionPool<Database> where Database: DatabaseKit.
             // connections are exhausted, we must wait for one to be returned
             let promise = eventLoop.newPromise(Database.Connection.self)
             waiters.append(promise)
+            lock.unlock()
             return promise.futureResult
         }
     }
@@ -135,8 +149,11 @@ public final class DatabaseConnectionPool<Database> where Database: DatabaseKit.
     /// - parameters:
     ///     - conn: `DatabaseConnection` to release back to the pool.
     public func releaseConnection(_ conn: Database.Connection) {
+        lock.lock()
+
         // get the active connection for this connection
         guard let active = actives.first(where: { $0.connection === conn }) else {
+            lock.unlock()
             assertionFailure("Attempted to release a connection to a pool that did not create it.")
             return
         }
@@ -147,7 +164,10 @@ public final class DatabaseConnectionPool<Database> where Database: DatabaseKit.
         // now that we know a new connection is available, we should
         // take this chance to fulfill one of the waiters
         if let waiter = waiters.popLast() {
+            lock.unlock()
             requestConnection().cascade(promise: waiter)
+        } else {
+            lock.unlock()
         }
     }
 }

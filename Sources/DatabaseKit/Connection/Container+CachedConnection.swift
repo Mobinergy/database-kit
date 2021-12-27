@@ -1,3 +1,5 @@
+import NIOConcurrencyHelpers
+
 /// Containers that have `DatabasesConfig` structs registered can be used to open, pool, and cache connections.
 extension Container {
     // MARK: Cached
@@ -34,28 +36,25 @@ extension Container {
             /// use the container to create a connection cache
             /// this must have been registered with the services
             let connections = try make(DatabaseConnectionCache.self)
-            if let current = connections.cache[database.uid]?.connection as? Future<Database.Connection> {
-                return current
-            }
-
-            /// create an active connection, since we don't have to worry about threading
-            /// we can be sure that .connection will be set before this is called again
-            let active = CachedDatabaseConnection()
-            connections.cache[database.uid] = active
 
             /// first get a pointer to the pool
             let pool = try poolContainer.connectionPool(to: database)
-            let conn = pool.requestConnection().map(to: Database.Connection.self) { conn in
-                /// then create an active connection that knows how to
-                /// release itself
-                active.release = {
-                    pool.releaseConnection(conn)
+
+            let active = connections.cache.insertValue(forKey: database.uid) {
+                /// create an active connection, since we don't have to worry about threading
+                /// we can be sure that .connection will be set before this is called again
+                let active = CachedDatabaseConnection()
+                active.connection = pool.requestConnection().map(to: Database.Connection.self) { conn in
+                    /// then create an active connection that knows how to
+                    /// release itself
+                    active.release = {
+                        pool.releaseConnection(conn)
+                    }
+                    return conn
                 }
-                return conn
+                return active
             }
-            /// set the active connection so it is returned next time
-            active.connection = conn
-            return conn
+            return active.connection as! Future<Database.Connection>
         } catch {
             return eventLoop.newFailedFuture(error: error)
         }
@@ -64,8 +63,11 @@ extension Container {
     /// Releases all connections created by calls to `requestCachedConnection(to:)`.
     public func releaseCachedConnections() throws {
         let connections = try make(DatabaseConnectionCache.self)
-        let conns = connections.cache
-        connections.cache = [:]
+        return releaseCachedConnections(connections)
+    }
+
+    private func releaseCachedConnections(_ connections: DatabaseConnectionCache) {
+        let conns = connections.cache.removeAll()
         for (_, conn) in conns {
             guard let release = conn.release else {
                 ERROR("Release callback not set.")
@@ -81,11 +83,11 @@ extension Container {
 /// Caches active database connections. Powers `Container.requestCachedConnection(...)`.
 internal final class DatabaseConnectionCache: ServiceType {
     /// Private storage
-    fileprivate var cache: [String: CachedDatabaseConnection]
+    fileprivate let cache: ConcurrentDictionary<String, CachedDatabaseConnection>
 
     /// Creates a new `DatabaseConnectionCache`
     private init() {
-        self.cache = [:]
+        self.cache = .init()
     }
 
     /// See `ServiceType`.
